@@ -1,0 +1,98 @@
+# Payment Hub Datalake — Pipeline Configuration
+# All paths are relative to the project root (where run_pipeline.py lives).
+# Change window_days to 30 for a 30-day rolling window — no code change required.
+
+paths:
+  input_payments: "data/payments"
+  input_merchants: "data/merchants/merchants.csv"
+  output_bronze_payments: "output/bronze_payments"
+  output_bronze_merchants: "output/bronze_merchants"
+  output_gold_daily: "output/gold/daily_payment_summary"
+  output_gold_merchant_7d: "output/gold/merchant_performance_7d"
+  bronze_payments_manifests: "output/bronze_payments/_manifests"
+  bronze_merchants_manifests: "output/bronze_merchants/_manifests"
+  run_reports: "output/run_reports"
+
+payments:
+  partition_key: "event_date"
+  file_pattern: "*.csv"
+  # Required columns that must be present in each payment CSV
+  required_columns:
+    - transaction_id
+    - merchant_id
+    - customer_id
+    - customer_email
+    - customer_phone
+    - amount
+    - currency
+    - status
+    - transaction_ts
+    - payment_method
+    - card_last4
+    - gateway_ref
+  metadata_columns:
+    - ingest_ts
+    - ingest_run_id
+    - source_file
+    - record_hash
+  # Columns excluded from record_hash computation (metadata itself)
+  hash_exclude_columns:
+    - ingest_ts
+    - ingest_run_id
+    - source_file
+    - record_hash
+
+merchants:
+  # Required columns that must be present in the merchant CSV
+  required_columns:
+    - merchant_id
+    - merchant_name
+    - merchant_category
+    - country
+    - onboarding_date
+    - is_active
+    - settlement_currency
+  # Columns excluded from record_hash computation (metadata itself)
+  hash_exclude_columns:
+    - ingest_ts
+    - ingest_run_id
+    - source_file
+    - record_hash
+
+gold:
+  # Rolling window in days — change here to get a 30-day window (Bonus B4)
+  window_days: 7
+  # Overwrite target partitions on re-run (idempotency strategy)
+  overwrite_partitions: true
+  # Statuses considered for approval_rate numerator
+  approved_status: "APPROVED"
+  # Statuses in the approval_rate denominator
+  approval_denominator_statuses:
+    - APPROVED
+    - DECLINED
+  # Payment method required for approval_rate calculation
+  approval_rate_payment_method: "CARD"
+  reversed_status: "REVERSED"
+
+  # ── Output schema contracts ────────────────────────────────────────────────
+  # These define the expected columns in each Gold output table.
+  # Validated AFTER building each table (output assertion, not input validation).
+  # If any column is missing, the pipeline logs an error and marks status=PARTIAL
+  # — giving downstream consumers a clear signal without silently producing bad data.
+  output_schema_daily_payment_summary:
+    - event_date
+    - merchant_id
+    - merchant_name
+    - merchant_category
+    - currency
+    - status
+    - transaction_count
+    - total_amount
+    - avg_amount
+    - max_amount
+    - approval_rate
+
+  output_schema_merchant_performance:
+    - snapshot_date
+    - merchant_id
+    - merchant_name

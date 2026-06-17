@@ -1,0 +1,9 @@
+merchant_id,merchant_name,merchant_category,country,onboarding_date,is_active,settlement_currency
+M001,TechGadgets Ltd,RETAIL,GB,2022-03-15,true,GBP
+M002,FastFood Express,FOOD,US,2021-07-20,true,USD
+M003,GlobalTravel Co,TRAVEL,SG,2023-01-10,true,SGD
+M004,EduLearn Platform,EDUCATION,AU,2022-09-05,true,AUD
+M005,HealthPlus Pharmacy,HEALTH,GB,2021-12-01,true,GBP
+M006,AutoParts Direct,RETAIL,US,2023-06-18,true,USD
+M007,StreamFlix Media,ENTERTAINMENT,AU,2022-04-22,true,AUD
+M008,QuickBite Delivery,FOOD,SG,2023-11-30,true,SGD
