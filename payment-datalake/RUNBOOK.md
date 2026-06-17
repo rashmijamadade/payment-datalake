@@ -405,3 +405,26 @@ duckdb.connect().execute(
 | Run with coverage | `python -m pytest tests/ -v --cov=src --cov-report=term-missing` |
 | Wipe and restart | Delete `output/bronze/event_date=*` and `output/gold/*/`, then re-run |
 | Ad-hoc query | `python` → `import duckdb; duckdb.connect().execute("SELECT * FROM read_parquet('output/gold/**/*.parquet')").df()` |
+
+---
+
+## 8. Known Limitations
+
+### Single-Writer Operation (Concurrent Run Assumption)
+
+This prototype is designed for **single-writer** use. Running two pipeline instances concurrently against the same file will result in duplicate rows being written to Bronze, because the hash-filter check happens before new rows are committed.
+
+**This is not a concern for normal daily operation** (one scheduled run per day). If you need to run multiple processes concurrently in a test environment, wipe the output first (Section 5) before re-running.
+
+**Production** (AWS): this is resolved by Iceberg `MERGE INTO`, which is transactionally safe.
+
+---
+
+### Full Bronze Scan on Standard Gold Runs
+
+When running Gold without a backfill date range (`--stage gold` with no `--mode backfill`), the pipeline reads **all** available Bronze partitions. For the 3-file prototype this is fast (< 0.5s), but as the Bronze store grows over months, each Gold run will read a progressively larger dataset.
+
+**Workaround** (available now): Use `--mode backfill --from_date YYYY-MM-DD --to_date YYYY-MM-DD` to limit the Gold scan to only the affected date range.
+
+**Production** (AWS): Iceberg partition statistics and Athena predicate pushdown eliminate this by only scanning matching partitions.
+

@@ -55,6 +55,36 @@ def _cast_types(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _quarantine_nan_amounts(df: pd.DataFrame, filename: str) -> tuple[pd.DataFrame, int]:
+    """
+    Separate rows with a NaN amount from valid rows.
+
+    Invalid amount values (e.g. "N/A", empty string) are coerced to NaN by
+    _cast_types(). If left in the dataset they would contribute to
+    transaction_count in Gold but be excluded from total_amount and avg_amount,
+    creating silent count-vs-sum discrepancies.
+
+    Returns
+    -------
+    (valid_df, quarantined_count)
+        valid_df          — rows where amount is not NaN
+        quarantined_count — number of rows quarantined
+    """
+    if "amount" not in df.columns:
+        return df, 0
+
+    nan_mask = df["amount"].isna()
+    n_quarantined = int(nan_mask.sum())
+    if n_quarantined:
+        logger.warning(
+            "Quarantining %d row(s) from '%s' with unparseable 'amount' values "
+            "(would cause silent count-vs-sum discrepancy in Gold).",
+            n_quarantined,
+            filename,
+        )
+    return df[~nan_mask].copy(), n_quarantined
+
+
 def _derive_event_date(df: pd.DataFrame) -> pd.DataFrame:
     """Add event_date (YYYY-MM-DD string) derived from transaction_ts."""
     df = df.copy()
@@ -143,12 +173,18 @@ def run_bronze_ingestion(
             df_typed = _cast_types(df_raw)
             df_dated = _derive_event_date(df_typed)
 
+            # ── Step 4b: Quarantine rows with unparseable amounts ─────────
+            # Rows where amount coerced to NaN would cause silent count-vs-sum
+            # discrepancies in Gold (counted in transaction_count but dropped
+            # from total_amount / avg_amount). Quarantine them explicitly here.
+            df_dated, rows_quarantined = _quarantine_nan_amounts(df_dated, filename)
+
             # ── Backfill filter (Bonus B2) ─────────────────────────────────
             if backfill_dates:
                 df_dated = df_dated[df_dated["event_date"].isin(backfill_dates)]
                 if df_dated.empty:
                     logger.info("Backfill: no rows in date range for '%s' — skipping.", filename)
-                    row_counts[filename] = {"read": 0, "written": 0, "skipped": 0}
+                    row_counts[filename] = {"read": 0, "written": 0, "skipped": 0, "quarantined": rows_quarantined}
                     continue
 
             # ── Step 6: Metadata enrichment ───────────────────────────────
@@ -166,7 +202,7 @@ def run_bronze_ingestion(
 
             rows_read = len(df_raw)
             rows_written = 0
-            rows_skipped = rows_read - len(df_new)
+            rows_skipped = rows_read - len(df_new) - rows_quarantined
 
             # ── Step 8: Write by partition ────────────────────────────────
             for event_date, group in df_new.groupby("event_date"):
@@ -177,19 +213,21 @@ def run_bronze_ingestion(
                 "read": rows_read,
                 "written": rows_written,
                 "skipped": rows_skipped,
+                "quarantined": rows_quarantined,
             }
             observer.record(
                 filename,
                 rows_read=rows_read,
                 rows_written=rows_written,
-                rows_quarantined=0,
+                rows_quarantined=rows_quarantined,
             )
             logger.info(
-                "Bronze | '%s': read=%d written=%d skipped=%d",
+                "Bronze | '%s': read=%d written=%d skipped=%d quarantined=%d",
                 filename,
                 rows_read,
                 rows_written,
                 rows_skipped,
+                rows_quarantined,
             )
 
     # ── Step 9: Run manifest ──────────────────────────────────────────────

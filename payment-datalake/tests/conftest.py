@@ -54,6 +54,7 @@ def make_payment_row(
     payment_method: str = "CARD",
     card_last4: str = "1234",
     gateway_ref: str = "GW-001",
+    ingest_ts: str = "2024-01-15 10:00:00+00:00",
 ) -> dict:
     """Return a single valid payment row as a dict."""
     return {
@@ -69,6 +70,7 @@ def make_payment_row(
         "payment_method": payment_method,
         "card_last4": card_last4,
         "gateway_ref": gateway_ref,
+        "ingest_ts": ingest_ts,
     }
 
 

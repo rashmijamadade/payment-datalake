@@ -315,6 +315,26 @@ This is simpler and correct for aggregated tables because the aggregation is det
 
 ---
 
+## Known Limitations — Local Prototype
+
+### Concurrent Run Race Condition
+
+**Assumption**: This prototype is designed for **single-writer** operation. Two concurrent pipeline runs on the same file will both pass the hash filter (hashes are not committed atomically) and write duplicate rows.
+
+**Why acceptable here**: Timestamp-based Parquet filenames (`part-{ts}.parquet`) prevent file overwrite. The duplicate row problem requires concurrent execution of the same pipeline, which is not a use case for a local prototype.
+
+**Production resolution**: The AWS design uses Iceberg `MERGE INTO` on `record_hash`, which is transactionally safe across concurrent Glue workers.
+
+### Full Bronze Scan in Gold (no backfill filter)
+
+**Behaviour**: When `backfill_dates=None`, the Gold pipeline calls `read_bronze(bronze_dir, event_dates=None)` which reads **all** Bronze partitions — a full-table scan with no partition pruning.
+
+**Growth characteristic**: As the Bronze store grows, each Gold run reads an increasingly large dataset. For a 3-file prototype this is negligible, but at production scale (months of daily partitions) this would be unacceptably slow.
+
+**Production resolution**: The AWS design uses Iceberg partition statistics and Athena predicate pushdown to skip non-matching files automatically. Locally, passing an explicit `backfill_dates` list (the `--mode backfill` flag) limits the scan to the required partitions.
+
+---
+
 ## Bonus: Schema Evolution Note (B3)
 
 **Backward-compatible change** (new nullable column `payment_network`):

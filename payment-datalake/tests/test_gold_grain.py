@@ -33,6 +33,7 @@ def _make_bronze_df(rows: list[dict]) -> pd.DataFrame:
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
     df["transaction_ts"] = pd.to_datetime(df["transaction_ts"], utc=True, errors="coerce")
     df["event_date"] = df["transaction_ts"].dt.strftime("%Y-%m-%d")
+    df["ingest_ts"] = pd.to_datetime(df["ingest_ts"], utc=True, errors="coerce")
     return df
 
 

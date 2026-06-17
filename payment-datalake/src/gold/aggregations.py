@@ -26,6 +26,19 @@ Design principles (unchanged from original):
 Grain documentation:
   daily_payment_summary      : (event_date, merchant_id, currency, status)
   merchant_performance_Nd    : (snapshot_date, merchant_id)
+
+Status-mutation handling (audit-log model):
+  Bronze intentionally stores every mutation of a transaction as a separate row
+  (SHA-256 detects any payload change, e.g. PENDING → APPROVED). Gold must not
+  double-count the same transaction_id. Both aggregation functions resolve this
+  by selecting only the latest row per transaction_id (by ingest_ts DESC) before
+  any aggregation. The full audit trail remains intact in Bronze.
+
+SQL injection defence:
+  Status strings and payment method values are interpolated into DuckDB SQL
+  f-strings (DuckDB does not support parameterised IN-list literals). All such
+  values are whitelist-validated via _validate_sql_literals() before any SQL is
+  built, ensuring that only known-good values can ever reach the query.
 """
 
 from __future__ import annotations
@@ -37,6 +50,41 @@ import duckdb
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Allowed SQL literal values (whitelist for injection defence)
+# ---------------------------------------------------------------------------
+
+# Extend these sets when new statuses or payment methods are added to the system.
+_ALLOWED_STATUSES: frozenset[str] = frozenset(
+    {"APPROVED", "DECLINED", "PENDING", "REVERSED", "REFUNDED", "FAILED"}
+)
+_ALLOWED_PAYMENT_METHODS: frozenset[str] = frozenset(
+    {"CARD", "BANK_TRANSFER", "WALLET", "DIRECT_DEBIT"}
+)
+
+
+def _validate_sql_literals(
+    statuses: List[str],
+    payment_method: str,
+) -> None:
+    """
+    Whitelist-validate status strings and payment method before SQL interpolation.
+
+    Raises ValueError if any value is not in the allowed set.
+    This is the defence against SQL injection via config-sourced values.
+    """
+    for s in statuses:
+        if s not in _ALLOWED_STATUSES:
+            raise ValueError(
+                f"Status {s!r} is not in the allowed whitelist for SQL interpolation. "
+                f"Allowed: {sorted(_ALLOWED_STATUSES)}"
+            )
+    if payment_method not in _ALLOWED_PAYMENT_METHODS:
+        raise ValueError(
+            f"Payment method {payment_method!r} is not in the allowed whitelist for SQL "
+            f"interpolation. Allowed: {sorted(_ALLOWED_PAYMENT_METHODS)}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -55,17 +103,25 @@ def build_daily_payment_summary(
 
     Grain: one row per (event_date, merchant_id, currency, status).
 
-    approval_rate is computed at the (event_date, merchant_id, currency) grain
-    — not per status — because it is a property of the merchant+date+currency
-    combo.  It measures what fraction of card-initiated attempts were approved.
+    merchant_daily_approval_rate is computed at the (event_date, merchant_id,
+    currency) grain — not per status — because it is a property of the
+    merchant+date+currency combo. It measures what fraction of card-initiated
+    attempts were approved.
+
+    Status-mutation dedup:
+    Bronze is an audit log where PENDING → APPROVED produces two distinct rows.
+    The ``deduped`` CTE retains only the latest row per transaction_id (ordered
+    by ingest_ts DESC) so each transaction is counted exactly once in Gold.
 
     SQL approach
     ------------
-    Two CTEs are used:
-      1. ``joined``      — payments LEFT JOINed with merchants for name/category.
-      2. ``approval``    — a sub-aggregation at the coarser grain that computes
-                           the approval rate with a safe NULL (not 0) when the
-                           denominator is zero.
+    Four CTEs are used:
+      1. ``deduped``   — window-rank to pick latest status per transaction_id.
+      2. ``latest``    — filter to rank=1 rows only.
+      3. ``joined``    — payments LEFT JOINed with merchants for name/category.
+      4. ``approval``  — a sub-aggregation at the coarser grain that computes
+                         the approval rate with a safe NULL (not 0) when the
+                         denominator is zero.
     Final SELECT groups at the full (event_date, merchant_id, currency, status)
     grain, then re-joins the approval rate from the coarser CTE.
     """
@@ -76,15 +132,34 @@ def build_daily_payment_summary(
         logger.warning("Bronze DataFrame is empty — daily_payment_summary will be empty.")
         return pd.DataFrame()
 
+    # ── SQL injection defence ─────────────────────────────────────────────────
+    _validate_sql_literals(approval_denominator_statuses, approval_rate_payment_method)
+
     # DuckDB SQL uses Python variables via f-strings for literals that cannot
-    # be parameterised (IN-lists, string literals in CASE).
+    # be parameterised (IN-lists, string literals in CASE). All values have
+    # been whitelist-validated above before reaching this point.
     denom_statuses_sql = ", ".join(f"'{s}'" for s in approval_denominator_statuses)
 
     sql = f"""
-    -- ── CTE 1: join payments with merchant dimension ─────────────────────
-    WITH joined AS (
+    -- ── CTE 1: resolve latest status per transaction_id (audit-log dedup) ──
+    -- Bronze stores every status mutation as a separate row (by design).
+    -- Gold must count each transaction_id only once, using its latest status.
+    WITH deduped AS (
+        SELECT *,
+               ROW_NUMBER() OVER (
+                   PARTITION BY transaction_id
+                   ORDER BY ingest_ts DESC
+               ) AS _rn
+        FROM bronze_df
+    ),
+    latest AS (
+        SELECT * EXCLUDE (_rn) FROM deduped WHERE _rn = 1
+    ),
+
+    -- ── CTE 2: join payments with merchant dimension ─────────────────────
+    joined AS (
         SELECT
-            CAST(p.event_date AS VARCHAR)           AS event_date,
+            CAST(p.event_date AS DATE)              AS event_date,
             p.merchant_id,
             m.merchant_name,
             m.merchant_category,
@@ -93,15 +168,17 @@ def build_daily_payment_summary(
             p.transaction_id,
             TRY_CAST(p.amount AS DOUBLE)            AS amount,
             p.payment_method
-        FROM bronze_df  AS p
+        FROM latest  AS p
         LEFT JOIN merchants_df AS m
             ON p.merchant_id = m.merchant_id
     ),
 
-    -- ── CTE 2: approval rate at (event_date, merchant_id, currency) grain ─
+    -- ── CTE 3: approval rate at (event_date, merchant_id, currency) grain ─
     -- NULLIF prevents division-by-zero on the denominator;
     -- returns NULL only when there are zero card APPROVED/DECLINED txns.
     -- When approved=0 but declined>0, returns 0.0 correctly (not NULL).
+    -- Named merchant_daily_approval_rate for clarity: this is the daily rate
+    -- for the merchant across all statuses, not the rate for a specific status.
     approval AS (
         SELECT
             event_date,
@@ -114,7 +191,7 @@ def build_daily_payment_summary(
                 COUNT_IF(payment_method = '{approval_rate_payment_method}'
                          AND status IN ({denom_statuses_sql})),
                 0
-            )                                       AS approval_rate
+            )                                       AS merchant_daily_approval_rate
         FROM joined
         GROUP BY event_date, merchant_id, currency
     )
@@ -131,7 +208,7 @@ def build_daily_payment_summary(
         ROUND(SUM(j.amount),      2)                AS total_amount,
         ROUND(AVG(j.amount),      4)                AS avg_amount,
         MAX(j.amount)                               AS max_amount,
-        ROUND(a.approval_rate,    4)                AS approval_rate
+        ROUND(a.merchant_daily_approval_rate, 4)    AS merchant_daily_approval_rate
     FROM joined AS j
     LEFT JOIN approval AS a
         ON  j.event_date   = a.event_date
@@ -144,11 +221,14 @@ def build_daily_payment_summary(
         j.merchant_category,
         j.currency,
         j.status,
-        a.approval_rate
+        a.merchant_daily_approval_rate
     ORDER BY j.event_date, j.merchant_id, j.currency, j.status
     """
 
     result = duckdb.query(sql).df()
+    # Ensure event_date is a plain YYYY-MM-DD string for partition directory names
+    if "event_date" in result.columns:
+        result["event_date"] = result["event_date"].astype(str).str[:10]
     logger.info("daily_payment_summary: %d rows produced.", len(result))
     return result
 
@@ -175,6 +255,11 @@ def build_merchant_performance_rolling(
     The *window_days* parameter is driven by config — changing it from 7 to 30
     requires only a config.yaml edit (Bonus B4 differentiator).
 
+    Status-mutation dedup:
+    The ``deduped`` CTE picks the latest row per transaction_id before any
+    aggregation, ensuring a single PENDING→APPROVED mutation is not double-counted
+    in total_transactions or total_approved_amount.
+
     SQL approach
     ------------
     A CROSS JOIN between the distinct date list and the distinct merchant list
@@ -195,18 +280,34 @@ def build_merchant_performance_rolling(
         logger.warning("Bronze DataFrame is empty — merchant_performance table will be empty.")
         return pd.DataFrame()
 
+    # ── SQL injection defence ─────────────────────────────────────────────────
+    _validate_sql_literals(approval_denominator_statuses, approval_rate_payment_method)
+
     denom_statuses_sql = ", ".join(f"'{s}'" for s in approval_denominator_statuses)
 
     # Column aliases are built dynamically so they reflect window_days
-    total_col        = f"total_transactions_{window_days}d"
-    approved_amt_col = f"total_approved_amount_{window_days}d"
-    approval_rate_col = f"approval_rate_{window_days}d"
+    total_col         = f"total_transactions_{window_days}d"
+    approved_amt_col  = f"total_approved_amount_{window_days}d"
+    approval_rate_col = f"merchant_daily_approval_rate_{window_days}d"
     reversal_rate_col = f"reversal_rate_{window_days}d"
-    active_days_col  = f"active_days_{window_days}d"
+    active_days_col   = f"active_days_{window_days}d"
 
     sql = f"""
-    -- ── CTE 1: cast & join payments with merchants ────────────────────────
-    WITH base AS (
+    -- ── CTE 1: resolve latest status per transaction_id (audit-log dedup) ──
+    WITH deduped AS (
+        SELECT *,
+               ROW_NUMBER() OVER (
+                   PARTITION BY transaction_id
+                   ORDER BY ingest_ts DESC
+               ) AS _rn
+        FROM bronze_df
+    ),
+    latest_txns AS (
+        SELECT * EXCLUDE (_rn) FROM deduped WHERE _rn = 1
+    ),
+
+    -- ── CTE 2: cast & join payments with merchants ────────────────────────
+    base AS (
         SELECT
             p.merchant_id,
             m.merchant_name,
@@ -214,26 +315,26 @@ def build_merchant_performance_rolling(
             TRY_CAST(p.amount AS DOUBLE)            AS amount,
             p.status,
             p.payment_method
-        FROM bronze_df  AS p
+        FROM latest_txns  AS p
         LEFT JOIN merchants_df AS m
             ON p.merchant_id = m.merchant_id
     ),
 
-    -- ── CTE 2: all distinct snapshot dates ───────────────────────────────
+    -- ── CTE 3: all distinct snapshot dates ───────────────────────────────
     dates AS (
         SELECT DISTINCT event_date AS snapshot_date
         FROM base
         WHERE event_date IS NOT NULL
     ),
 
-    -- ── CTE 3: all distinct merchants ────────────────────────────────────
+    -- ── CTE 4: all distinct merchants ────────────────────────────────────
     merchants AS (
         SELECT DISTINCT merchant_id, FIRST(merchant_name) AS merchant_name
         FROM base
         GROUP BY merchant_id
     ),
 
-    -- ── CTE 4: cross-join dates x merchants, then aggregate the window ───
+    -- ── CTE 5: cross-join dates x merchants, then aggregate the window ───
     -- The WHERE clause in the sub-join implements the N-day rolling window:
     --   event_date BETWEEN snapshot_date - (N-1) days AND snapshot_date
     rolling AS (

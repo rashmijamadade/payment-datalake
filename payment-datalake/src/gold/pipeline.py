@@ -152,6 +152,7 @@ def run_gold_pipeline(
                 daily_df,
                 config.gold.output_schema_daily_payment_summary,
                 source_file="daily_payment_summary (Gold output)",
+                strict=True,
             )
             if not schema_check:
                 logger.error(
@@ -205,10 +206,18 @@ def run_gold_pipeline(
 
         # ── Output schema assertion: merchant_performance ─────────────────
         if config.gold.output_schema_merchant_performance:
+            expected_cols = list(config.gold.output_schema_merchant_performance) + [
+                f"total_transactions_{config.gold.window_days}d",
+                f"total_approved_amount_{config.gold.window_days}d",
+                f"merchant_daily_approval_rate_{config.gold.window_days}d",
+                f"reversal_rate_{config.gold.window_days}d",
+                f"active_days_{config.gold.window_days}d",
+            ]
             schema_check = validate_schema(
                 rolling_df,
-                config.gold.output_schema_merchant_performance,
+                expected_cols,
                 source_file=f"merchant_performance_{config.gold.window_days}d (Gold output)",
+                strict=True,
             )
             if not schema_check:
                 logger.error(

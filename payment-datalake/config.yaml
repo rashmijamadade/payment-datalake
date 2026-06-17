@@ -90,9 +90,11 @@ gold:
     - total_amount
     - avg_amount
     - max_amount
-    - approval_rate
+    - merchant_daily_approval_rate
 
   output_schema_merchant_performance:
     - snapshot_date
     - merchant_id
     - merchant_name
+    # NOTE: approval_rate column names are window-suffixed (e.g. merchant_daily_approval_rate_7d)
+    # and validated dynamically in the pipeline — not listed here by static name.
