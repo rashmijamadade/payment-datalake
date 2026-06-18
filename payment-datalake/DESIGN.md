@@ -72,6 +72,12 @@ flowchart LR
 | **Pipeline** | Run observability | Structured JSON reports for Bronze and Gold with quarantine counts | `observability.py` |
 | **Pipeline** | Schema evolution | Extra columns pass validation; nullable new columns fill `None` for old files | `schema_validator.py` |
 
+Note: 
+Why I have ignored Silver Layer?
+- Simpler architecture reduces effort and maintenance.
+- Proof of Concept.
+- Low data volume scenario.
+
 #### Performance Characteristics — Local Prototype
 
 | Aspect | Design Choice | Impact |
